@@ -1,29 +1,19 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use mini_redis::{Connection, Frame};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 
-type ShardedDb = Arc<Vec<Mutex<HashMap<String, Bytes>>>>;
+type DB = Arc<Mutex<HashMap<String, Bytes>>>;
 
 #[tokio::main]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    let db = Arc::new(Mutex::new(HashMap::new()));
 
     println!("Listening");
-
-    fn new_sharded_db(num_shards: usize) -> ShardedDb {
-        let mut db = Vec::with_capacity(num_shards);
-        for _ in 0..num_shards {
-            db.push(Mutex::new(HashMap::new()));
-        }
-        Arc::new(db)
-    }
-
-    let db = new_sharded_db(4);
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();
@@ -37,13 +27,7 @@ async fn main() {
     }
 }
 
-fn calculate_hash<T: Hash + ?Sized>(t: &T) -> u64 {
-    let mut s = DefaultHasher::new();
-    t.hash(&mut s);
-    s.finish()
-}
-
-async fn process(socket: TcpStream, db: ShardedDb) {
+async fn process(socket: TcpStream, db: DB) {
     use mini_redis::Command::{self, Get, Set};
 
     // Connection, provided by `mini-redis`, handles parsing frames from
@@ -53,19 +37,15 @@ async fn process(socket: TcpStream, db: ShardedDb) {
     while let Some(frame) = connection.read_frame().await.unwrap() {
         let response = match Command::from_frame(frame).unwrap() {
             Set(cmd) => {
-                // https://doc.rust-lang.org/std/hash/index.html
-                let hash = calculate_hash(cmd.key());
-                let mut shard = db[hash as usize % db.len()].lock().unwrap();
-                // TODO: IDK why Set's key is String, but calling key() returns &str
-                // https://github.com/tokio-rs/mini-redis/blob/b1e365b62fd056653f5a883798317df3fdbfcf49/src/cmd/set.rs#L46
-                shard.insert(cmd.key().to_string(), cmd.value().clone());
+                // Notice: Tokio Mutex don't need to unwrap()
+                let mut db = db.lock().await;
+                db.insert(cmd.key().to_string(), cmd.value().clone());
 
                 Frame::Simple("OK".to_string())
             }
             Get(cmd) => {
-                let hash = calculate_hash(cmd.key());
-                let shard = db[hash as usize % db.len()].lock().unwrap();
-                if let Some(value) = shard.get(cmd.key()) {
+                let db = db.lock().await;
+                if let Some(value) = db.get(cmd.key()) {
                     Frame::Bulk(value.clone())
                 } else {
                     Frame::Null
