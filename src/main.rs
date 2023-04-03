@@ -1,12 +1,13 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::ptr::hash;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use mini_redis::{Connection, Frame};
 use tokio::net::{TcpListener, TcpStream};
 
-type Db = Arc<Mutex<HashMap<String, Bytes>>>;
+type ShardedDb = Arc<Vec<Mutex<HashMap<String, Bytes>>>>;
 
 #[tokio::main]
 async fn main() {
@@ -14,7 +15,15 @@ async fn main() {
 
     println!("Listening");
 
-    let db = Arc::new(Mutex::new(HashMap::new()));
+    fn new_sharded_db(num_shards: usize) -> ShardedDb {
+        let mut db = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
+            db.push(Mutex::new(HashMap::new()));
+        }
+        Arc::new(db)
+    }
+
+    let db = new_sharded_db(4);
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();
@@ -28,7 +37,13 @@ async fn main() {
     }
 }
 
-async fn process(socket: TcpStream, db: Db) {
+fn calculate_hash<T: Hash + ?Sized>(t: &T) -> u64 {
+    let mut s = DefaultHasher::new();
+    t.hash(&mut s);
+    s.finish()
+}
+
+async fn process(socket: TcpStream, db: ShardedDb) {
     use mini_redis::Command::{self, Get, Set};
 
     // Connection, provided by `mini-redis`, handles parsing frames from
@@ -38,13 +53,19 @@ async fn process(socket: TcpStream, db: Db) {
     while let Some(frame) = connection.read_frame().await.unwrap() {
         let response = match Command::from_frame(frame).unwrap() {
             Set(cmd) => {
-                let mut db = db.lock().unwrap();
-                db.insert(cmd.key().to_string(), cmd.value().clone());
+                // https://doc.rust-lang.org/std/hash/index.html
+                let hash = calculate_hash(cmd.key());
+                let mut shard = db[hash as usize % db.len()].lock().unwrap();
+                // TODO: IDK why Set's key is String, but calling key() returns &str
+                // https://github.com/tokio-rs/mini-redis/blob/b1e365b62fd056653f5a883798317df3fdbfcf49/src/cmd/set.rs#L46
+                shard.insert(cmd.key().to_string(), cmd.value().clone());
+
                 Frame::Simple("OK".to_string())
             }
             Get(cmd) => {
-                let db = db.lock().unwrap();
-                if let Some(value) = db.get(cmd.key()) {
+                let hash = calculate_hash(cmd.key());
+                let shard = db[hash as usize % db.len()].lock().unwrap();
+                if let Some(value) = shard.get(cmd.key()) {
                     Frame::Bulk(value.clone())
                 } else {
                     Frame::Null
