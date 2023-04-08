@@ -1,65 +1,95 @@
 use bytes::Bytes;
 use mini_redis::client;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+// In this example, we use mpsc to manage communication between the manager and other tasks.
+// Finally, the manager plays the role of communicating with the Redis socket.
+// In the mpsc communication struct, we use oneshot to receive the response returned by Redis.
+// Oneshot is created by the caller task, and after the manager receives the response, it passes it to oneshot,
+// which returns the response to the caller task.
+
+/// Provided by the requester and used by the manager task to send the command
+/// response back to the requester.
+type Responder<T> = oneshot::Sender<mini_redis::Result<T>>;
+
+/// Multiple different commands are multiplexed over a single channel.
 #[derive(Debug)]
 enum Command {
     Get {
         key: String,
+        resp: Responder<Option<Bytes>>,
     },
     Set {
         key: String,
         val: Bytes,
+        resp: Responder<()>,
     },
 }
 
 #[tokio::main]
 async fn main() {
     let (tx, mut rx) = mpsc::channel(32);
-    // The `Sender` handles are moved into the tasks. As there are two
-    // tasks, we need a second `Sender`.
+    // Clone a `tx` handle for the second f
     let tx2 = tx.clone();
 
-    // Spawn two tasks, one gets a key, the other sets a key
-    let t1 = tokio::spawn(async move {
-        let cmd = Command::Get {
-            key: "foo".to_string(),
-        };
-
-        tx.send(cmd).await.unwrap();
-    });
-
-    let t2 = tokio::spawn(async move {
-        let cmd = Command::Set {
-            key: "foo".to_string(),
-            val: "bar".into(),
-        };
-
-        tx2.send(cmd).await.unwrap();
-    });
-
-    // spawn a task that processes messages from the channel. First, a client connection is established to Redis.
-    // Then, received commands are issued via the Redis connection.
     let manager = tokio::spawn(async move {
-        // Establish a connection to the server
+        // Open a connection to the mini-redis address.
         let mut client = client::connect("127.0.0.1:6379").await.unwrap();
 
-        // Start receiving messages
         while let Some(cmd) = rx.recv().await {
-            use Command::*;
-
             match cmd {
-                Get { key } => {
-                    client.get(&key).await;
+                Command::Get { key, resp } => {
+                    let res = client.get(&key).await;
+                    // Ignore errors
+                    let _ = resp.send(res);
                 }
-                Set { key, val } => {
-                    client.set(&key, val).await;
+                Command::Set { key, val, resp } => {
+                    let res = client.set(&key, val).await;
+                    // Ignore errors
+                    let _ = resp.send(res);
                 }
             }
         }
     });
 
-    // .await the join handles to ensure the commands fully complete before the process exits
+    // Spawn two tasks, one setting a value and other querying for key that was set.
+    let t1 = tokio::spawn(async move {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = Command::Get {
+            key: "foo".to_string(),
+            resp: resp_tx,
+        };
+
+        // Send the GET request
+        if tx.send(cmd).await.is_err() {
+            eprintln!("connection task shutdown");
+            return;
+        }
+
+        // Await the response
+        let res = resp_rx.await;
+        println!("GOT (Get) = {:?}", res);
+    });
+
+    let t2 = tokio::spawn(async move {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = Command::Set {
+            key: "foo".to_string(),
+            val: "bar".into(),
+            resp: resp_tx,
+        };
+
+        // Send the SET request
+        if tx2.send(cmd).await.is_err() {
+            eprintln!("connection task shutdown");
+            return;
+        }
+
+        // Await the response
+        let res = resp_rx.await;
+        println!("GOT (Set) = {:?}", res);
+    });
+
     t1.await.unwrap();
     t2.await.unwrap();
     manager.await.unwrap();
